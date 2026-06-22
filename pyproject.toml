@@ -24,3 +24,9 @@ dependencies = [
     "tqdm",
     "uvicorn",
 ]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ruff>=0.15.18",
+]
