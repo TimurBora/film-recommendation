@@ -3,7 +3,9 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 import logging
-
+from letterboxdpy.movie import Movie
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ class MovieLensDataLoader:
         self.links_df = None
         self.genre_matrix = None
         self.tag_matrix = None
+        self.movie_data = []
 
     def load_data(self) -> Dict[str, pd.DataFrame]:
         logger.info("Loading MovieLens dataset...")
@@ -155,3 +158,103 @@ class MovieLensDataLoader:
 
         genres = movie_info.iloc[0]["genres"].split("|")
         return genres
+   
+
+    def fetch_single_movie(self, row):
+        """Worker function to fetch data for one movie (runs in parallel)"""
+        movie_id = row.movieId
+        
+        try:
+            # Try TMDb first
+            movie = Movie.from_tmdb(int(row.tmdbId))
+            
+            # Fallback to IMDb if TMDb returns None
+            if movie is None and pd.notna(row.imdbId):
+                movie = Movie.from_imdb(int(row.imdbId))
+                
+            if movie is None:
+                return None
+
+            # Extract features safely and optimize lookups using Walrus operator
+            cast = movie.get_cast() or []
+            fullcast = [slug for item in cast if (slug := item.get("slug"))][:5] # Auto-slices safely
+            
+            crew = movie.get_crew() or {}
+            director_list = crew.get("director", [])
+            director_l = director_list[0].get("slug") if director_list else None
+            
+            mainact = fullcast[0] if fullcast else None
+        
+            return {
+                "title": movie.title,
+                "year": movie.year,
+                "crew": movie.crew,
+                "cast": fullcast,
+                "main_actor": mainact,
+                "director": director_l,
+                "rating": movie.rating,
+                "runtime": movie.runtime,
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching data for movie ID {movie_id}: {e}")
+            return None
+
+    def letterboxd_data(self):
+        """Optimized main loop using concurrent threads"""
+        rows = list(self.links_df.itertuples())
+        
+        # Adjust max_workers based on API rate limits (10-20 is usually a sweet spot)
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            # Submit all tasks to the thread pool
+            futures = {executor.submit(self.fetch_single_movie, row): row for row in rows}
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    self.movie_data.append(result)
+    # def letterboxd_data(self):
+    #     for  row in self.links_df.itertuples():
+            
+    #         movie_id = row.movieId
+            
+    #         letterboxd_id = int(row.tmdbId)
+    #         #print(letterboxd_id)
+
+    #         try:
+
+    #             movie = Movie.from_tmdb(letterboxd_id)
+    #             if movie is None:
+    #                 letterboxd_id = int(row.imdbId)
+    #                 movie = Movie.from_imdb(letterboxd_id)
+    #                 if movie is None:
+    #                     logger.warning(f"Letterboxd data not found for movie ID {movie_id}")
+    #                     continue
+    #             #print(movie.cast)
+    #             cast = movie.get_cast()
+                
+    #             fullcast = [item["slug"] for item in cast if "slug" in item] 
+                
+    #             crew = movie.get_crew()
+    #             director_l = crew["director"][0]["slug"] if "director" in crew and crew["director"] else None
+    #             #print(director_l)
+    #             #direc = json.loads(director_l)
+    #             #print(direc["slug"])
+                
+    #             fullcast = fullcast[: 5] if len(fullcast) > 5 else fullcast
+    #             mainact = fullcast[0] if fullcast else None
+                
+    #             self.movie_data.append({
+    #                 "title": movie.title,
+    #                 "year": movie.year,
+    #                 "crew": movie.crew,
+    #                 "cast": fullcast,
+    #                 "main_actor": mainact,
+    #                 "director": director_l,
+    #                 "rating": movie.rating,
+    #                 "runtime": movie.runtime,})
+    #             #print(str(movie.year) + '\n' + str(movie.title) + '\n' + str(movie.crew) + '\n' + str(movie.cast) + '\n' + str(movie.rating) + '\n')
+    #             # Process the movie data as needed
+    #             #logger.info(f"Fetched Letterboxd data for movie ID {movie_id}: {movie.title}")
+    #         except Exception as e:
+    #             logger.error(f"Error fetching Letterboxd data for movie ID {movie_id}: {e}")
