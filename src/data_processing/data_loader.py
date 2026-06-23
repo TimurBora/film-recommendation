@@ -155,3 +155,13 @@ class MovieLensDataLoader:
 
         genres = movie_info.iloc[0]["genres"].split("|")
         return genres
+
+    def get_genre_matrix(self) -> np.ndarray:
+        if self.genre_matrix is None:
+            self.preprocess_movies()
+        return self.genre_matrix
+
+    def get_movie_id_to_index(self) -> Dict[int, int]:
+        if self.movies_df is None:
+            self.load_data()
+        return {mid: idx for idx, mid in enumerate(self.movies_df["movieId"])}
