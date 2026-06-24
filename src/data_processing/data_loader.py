@@ -104,11 +104,13 @@ class MovieLensDataLoader:
     def preprocess_movies(self) -> pd.DataFrame:
         if self.movies_df is None:
             raise ValueError("Movies data not loaded. Call load_data() first.")
-        genre_dummies = self.movies_df["genres"].str.get_dummies("|")
-        genre_dummies.columns = [f"genre_{col}" for col in genre_dummies.columns]
+        
+        genre_dummies = self.movies_df["genres"].str.get_dummies(sep='|')
+        genre_dummies.columns = [f"genre_{col.lower()}" for col in genre_dummies.columns]
+        
         self.genre_matrix = genre_dummies.values.astype(float)
         return genre_dummies
-
+    
     def preprocess_tags(self) -> pd.DataFrame:
         if self.tags_df is None:
             raise ValueError("Tags data not loaded. Call load_data() first.")
