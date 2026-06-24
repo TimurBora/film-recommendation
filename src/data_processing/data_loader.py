@@ -61,6 +61,7 @@ async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore
             year = data.get('release_date', '').split('-')[0] if data.get('release_date') else None
             
             return {
+                "movieId": int(row.movieId),
                 "title": data.get('title', ''),
                 "year": year,
                 "cast": fullcast,

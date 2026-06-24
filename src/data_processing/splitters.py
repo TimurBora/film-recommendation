@@ -8,7 +8,6 @@ class DataSplitter:
         self.relevance_threshold = relevance_threshold
 
     def leave_one_out(self) -> Dict[str, pd.DataFrame]:
-        """Leave-One-Out (LOO). Последний interaction -> Test, предпоследний -> Val, остальное -> Train."""
         df = self.ratings_df.sort_values(by=['userId', 'timestamp'])
         grouped = df.groupby('userId')
         
@@ -32,7 +31,6 @@ class DataSplitter:
         }
 
     def global_temporal_split(self, train_ratio: float = 0.8) -> Dict[str, pd.DataFrame]:
-        """Глобальный временной сплит (Индустриальный стандарт)."""
         df = self.ratings_df.sort_values(by='timestamp')
         split_idx = int(len(df) * train_ratio)
         
@@ -43,7 +41,6 @@ class DataSplitter:
         }
 
     def chronological_kfold(self, k: int = 5) -> List[Dict[str, pd.DataFrame]]:
-        """Хронологический K-Fold для каждого пользователя."""
         df = self.ratings_df.sort_values(by=['userId', 'timestamp'])
         folds = []
         

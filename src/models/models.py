@@ -7,25 +7,6 @@ class RecommenderProtocol(Protocol):
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]: ...
     def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = 10) -> List[int]: ...
 
-class CFWrapper:
-    def __init__(self, cf_model):
-        self.cf_model = cf_model
-        self.all_item_ids = set()
-        
-    def fit(self, train_df: pd.DataFrame):
-        self.all_item_ids = set(train_df['movieId'].unique())
-        self.cf_model.fit(train_df)
-        return self
-        
-    def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
-        return [self.cf_model.predict_score(user_id, mid) for mid in item_ids]
-        
-    def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = 10) -> List[int]:
-        if hasattr(self.cf_model, 'recommend_for_user'):
-            recs = self.cf_model.recommend_for_user(user_id, list(watched_items), top_n=k)
-            return [mid for mid, score in recs]
-        return []
-
 # class ContentBasedRecommender:
 #     def __init__(self, genre_matrix: np.ndarray, movie_id_to_idx: Dict[int, int]):
 #         self.genre_matrix = genre_matrix
