@@ -19,11 +19,12 @@ async def fetch_tmdb_movie_data(session: aiohttp.ClientSession, tmdb_id: int) ->
     url = f"{TMDB_BASE_URL}/movie/{tmdb_id}"
     params = {
         "api_key": TMDB_API_KEY,
-        "append_to_response": "credits" 
+        "append_to_response": "credits,keywords",
+        
     }
     
     try:
-        async with session.get(url, params=params, timeout=10) as response:
+        async with session.get(url, params=params, timeout=7) as response:
             if response.status == 429:
                 retry_after = int(response.headers.get("Retry-After", 1))
                 await asyncio.sleep(retry_after)
@@ -34,7 +35,7 @@ async def fetch_tmdb_movie_data(session: aiohttp.ClientSession, tmdb_id: int) ->
                 
             return await response.json()
     except Exception as e:
-        logger.debug(f"Error fetching TMDB data for ID {tmdb_id}: {e}")
+        #logger.debug(f"Error fetching TMDB data for ID {tmdb_id}: {e}")
         return None
 
 
@@ -49,17 +50,19 @@ async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore
             
         try:
             credits_data = data.get('credits', {})
+            
             cast_list = credits_data.get('cast', [])
             crew_list = credits_data.get('crew', [])
-            
-            fullcast = [c.get('name') for c in cast_list[:5] if c.get('name')]
+            vote_count = data.get('vote_count')
+            fullcast = [c['name'] for c in cast_list[:5] if 'name' in c]
             main_actor = fullcast[0] if fullcast else None
             
-            directors = [c.get('name') for c in crew_list if c.get('job') == 'Director']
-            director_name = directors[0] if directors else None
+            director_name = next((c['name'] for c in crew_list if c.get('job') == 'Director'), None)
             
             year = data.get('release_date', '').split('-')[0] if data.get('release_date') else None
-            
+            keywords_wrapper = data.get('keywords', {})
+            keywords_list = keywords_wrapper.get('keywords', [])
+            keywords = [kw.get('name') for kw in keywords_list if kw.get('name')]
             return {
                 "movieId": int(row.movieId),
                 "title": data.get('title', ''),
@@ -69,6 +72,8 @@ async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore
                 "director": director_name,
                 "rating": data.get('vote_average', 0.0), 
                 "runtime": data.get('runtime', 0),
+                "keywords": keywords,
+                "vote_count": vote_count
             }
         except Exception as e:
             logger.error(f"Error parsing JSON for movieId {getattr(row, 'movieId', '?')}: {e}")

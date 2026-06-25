@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ContentBasedConfig:
     # Sum (1.0)
-    main_actor_weight: float = 0.10
-    director_weight: float = 0.40
+    main_actor_weight: float = 0.04
+    director_weight: float = 0.30
     cast_weight: float = 0.10
-    numerical_weight: float = 0.40
+    keywords_weight: float = 0.60
+    genre_weight:float = 0.15
+    numerical_weight: float = 0.30
     
     tfidf_sublinear_tf: bool = True
     tfidf_max_features: Optional[int] = None
@@ -38,7 +40,7 @@ class ContentBasedConfig:
 class ContentBasedRecommender:    
     def __init__(self, config: Optional[ContentBasedConfig] = None):
         self.config = config or ContentBasedConfig()
-        
+        self.tfidf_keywords = None
         self.tfidf_main_actor = None
         self.tfidf_director = None
         self.tfidf_cast = None
@@ -111,7 +113,11 @@ class ContentBasedRecommender:
         # MinMaxScaler
         self.scaler_year = MinMaxScaler()
         df["year"] = self.scaler_year.fit_transform(year_transformed)
-        
+        #--- VOTE COUNT ---
+        median_votes = df["vote_count"].astype(float).median()
+        df["vote_count"] = df['vote_count'].fillna(median_votes)
+        qt = QuantileTransformer(output_distribution='uniform')
+        df["vote_count"] = qt.fit_transform(df[["vote_count"]].astype(float))
         return df
     
     def _preprocess_actor_director_ratings(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -186,21 +192,40 @@ class ContentBasedRecommender:
             lambda x: self._weight_cast_members(x) if isinstance(x, list) else str(x)
         )
         cast_tfidf = self.tfidf_cast.fit_transform(cast_weighted)
-        
+
+        self.tfidf_keywords = TfidfVectorizer(
+            sublinear_tf=self.config.tfidf_sublinear_tf,
+            max_features=self.config.tfidf_max_features
+        )
+        keywords_cleaned = df["keywords"].apply(
+            lambda x: ' '.join(self._clean_text(x)) if isinstance(x, list) else ""
+        )
+        keywords_tfidf = self.tfidf_keywords.fit_transform(keywords_cleaned)
         numerical_features = df[[
-            'runtime', 'year', 'main_actor_rating', 'director_rating'
+            'runtime', 
+            'year', 
+            'main_actor_rating',
+              'director_rating',
+              'vote_count'
         ]].values
         numerical_matrix = csr_matrix(numerical_features)
+
+        genre_cols = [col for col in df.columns if col.startswith("genre_")]
+        genre_matrix = csr_matrix(df[genre_cols].values.astype(float))
         
         main_actor_tfidf = main_actor_tfidf * self.config.main_actor_weight
         director_tfidf = director_tfidf * self.config.director_weight
         cast_tfidf = cast_tfidf * self.config.cast_weight
+        keywords_tfidf = keywords_tfidf * self.config.keywords_weight
+        genre_matrix = genre_matrix * self.config.genre_weight
         numerical_matrix = numerical_matrix * self.config.numerical_weight
         
         combined_features = hstack([
             main_actor_tfidf,
             director_tfidf,
             cast_tfidf,
+            keywords_tfidf,
+            genre_matrix,
             numerical_matrix
         ])
         
@@ -246,7 +271,7 @@ class ContentBasedRecommender:
         logger.info("Starting fit process...")
         
         # Проверка наличия необходимых колонок в movies_df
-        required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year']
+        required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
         missing_cols = [col for col in required_cols if col not in movies_df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in movies_df: {missing_cols}")
@@ -261,7 +286,7 @@ class ContentBasedRecommender:
         
         logger.info("Step 3/5: Building feature matrix...")
         features_matrix = self._build_feature_matrix(df_processed)
-        
+        self.feature_matrix = features_matrix
         logger.info("Step 4/5: Computing similarity matrix...")
         self.similarity_matrix = self._compute_similarity_matrix(features_matrix)
         
@@ -288,7 +313,7 @@ class ContentBasedRecommender:
             
         self.is_fitted = True
         logger.info("Fit process completed successfully!")
-
+        self.movie_vote_counts = dict(zip(df_processed['movieId'], df_processed['vote_count']))
         if 'title' in movies_df.columns:
             self.movie_id_to_title = dict(zip(movies_df['movieId'], movies_df['title']))
         else:
@@ -298,43 +323,45 @@ class ContentBasedRecommender:
 
     def _build_user_profiles(self, ratings_df: pd.DataFrame):
         """
-        Построение профилей пользователей с использованием ВЕКТОРИЗАЦИИ NumPy.
-        Это в сотни раз быстрее, чем итерация через iterrows().
+        Построение профилей пользователей - ОПТИМИЗИРОВАНО ДЛЯ SPARSE МАТРИЦ.
         """
         self.user_profiles = {}
         
-        # Оставляем только те оценки, фильмы для которых есть в нашей матрице сходства
-        valid_df = ratings_df[ratings_df['movieId'].isin(self.movie_id_to_idx)].copy()
+        good_ratings_df = ratings_df[ratings_df['rating'] >= 4.0]
+        valid_df = good_ratings_df[good_ratings_df['movieId'].isin(self.movie_id_to_idx)].copy()
         
         if valid_df.empty:
             logger.warning("No valid ratings found to build user profiles.")
             return
             
-        # Маппим movieId -> индекс в матрице сходства
         valid_df['movie_idx'] = valid_df['movieId'].map(self.movie_id_to_idx)
         
         for user_id, group in valid_df.groupby('userId'):
             idxs = group['movie_idx'].values
-            weights = group['rating'].values
+            weights = group['rating'].values  # Oblik: (K,)
             
-            # Векторизованный расчет профиля:
-            # weights: массив формы (K,)
-            # self.similarity_matrix[idxs]: матрица формы (K, N), где N - кол-во фильмов
-            # np.dot возвращает массив формы (N,) - взвешенную сумму строк матрицы сходства
-            profile = np.dot(weights, self.similarity_matrix[idxs])
+            # Uzimamo sparse podmatricu za filmove koje je korisnik gledao: (K, Broj_Karakteristika)
+            user_features_sparse = self.feature_matrix[idxs]
             
-            # Нормализация профиля
+            # weights je 1D niz, pa ga transponujemo u 2D (1, K) da bi mogao da se pomnoži sa sparse matricom
+            # (1, K) x (K, Broj_Karakteristika) -> (1, Broj_Karakteristika)
+            profile_sparse = csr_matrix(weights) * user_features_sparse
+            
+            # Pretvaramo samo ovaj jedan krajnji red u običan 1D NumPy niz dužine (Broj_Karakteristika,)
+            profile = np.asarray(profile_sparse.todense()).reshape(-1)
+            
+            # Normalizacija
             norm = np.linalg.norm(profile)
             if norm > 0:
                 profile = profile / norm
                 
             self.user_profiles[user_id] = profile
             
-        logger.info(f"Built profiles for {len(self.user_profiles)} users.")
+        logger.info(f"Built sparse-optimized profiles for {len(self.user_profiles)} users.")
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
         """
-            score = dot(user_profile, similarity_vector) / (|profile| * |sim_vector|)
+        Вычисление скоров с использованием чистого SciPy Sparse indeksiranja.
         """
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
@@ -343,7 +370,7 @@ class ContentBasedRecommender:
             logger.warning(f"User {user_id} not found. Returning popularity-based scores.")
             return self._predict_popularity_scores(item_ids)
         
-        profile = self.user_profiles[user_id]
+        profile = self.user_profiles[user_id]  # Gusti niz oblika (Broj_Karakteristika,)
         
         valid_candidates = [
             (i, mid) for i, mid in enumerate(item_ids)
@@ -357,22 +384,29 @@ class ContentBasedRecommender:
                 self.movie_id_to_idx[mid] for _, mid in valid_candidates
             ])
             
-            sim_vectors = self.similarity_matrix[cand_indices]
+            # Izvlačimo sparse matricu samo za kandidate: (Broj_Kandidata, Broj_Karakteristika)
+            cand_vectors_sparse = self.feature_matrix[cand_indices]
             
-            dots = np.dot(sim_vectors, profile)
+            # Množimo sparse matricu kandidata sa gustim profilom (koristimo .dot())
+            # (Broj_Kandidata, Broj_Karakteristika) x (Broj_Karakteristika,) -> (Broj_Kandidata,)
+            dots = cand_vectors_sparse.dot(profile)
             
-            sim_norms = np.linalg.norm(sim_vectors, axis=1)
+            # Računanje normi za kosinusnu sličnost direktno nad sparse podmatricom
+            # Pošto norm ne radi direktno na sparse po osama, računamo sumu kvadrata nenultih elemenata
+            cand_norms = np.sqrt(np.asarray(cand_vectors_sparse.power(2).sum(axis=1))).reshape(-1)
             profile_norm = np.linalg.norm(profile)
             
-            norms = sim_norms * profile_norm
+            norms = cand_norms * profile_norm
             mask = norms > 0
             
             valid_scores = np.zeros_like(dots)
             valid_scores[mask] = dots[mask] / norms[mask]
             
             for i, (orig_idx, _) in enumerate(valid_candidates):
-                scores[orig_idx] = valid_scores[i]
-        
+                pure = valid_scores[i] 
+                pop = self.movie_vote_counts.get(_, 0.0)
+                soft_popularity = 0.35 + (0.65 * pop)
+                scores[orig_idx] = pure * soft_popularity
         return scores.tolist()
     
     def _predict_popularity_scores(self, item_ids: List[int]) -> List[float]:
