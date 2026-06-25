@@ -263,13 +263,6 @@ class ContentBasedRecommender:
     from typing import Optional
 
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
-        """
-        Полный пайплайн обучения.
-        
-        :param movies_df: DataFrame с метаданными фильмов (cast, director, runtime, year и т.д.)
-        :param ratings_df: DataFrame с оценками пользователей (userId, movieId, rating). 
-                        Если не передан, профили пользователей не строятся (cold start).
-        """
         logger.info("Starting fit process...")
         
         # Проверка наличия необходимых колонок в movies_df
@@ -324,9 +317,6 @@ class ContentBasedRecommender:
         return self
 
     def _build_user_profiles(self, ratings_df: pd.DataFrame):
-        """
-        Построение профилей пользователей - ОПТИМИЗИРОВАНО ДЛЯ SPARSE МАТРИЦ.
-        """
         self.user_profiles = {}
         
         good_ratings_df = ratings_df[ratings_df['rating'] >= 4.0]
@@ -362,9 +352,6 @@ class ContentBasedRecommender:
         logger.info(f"Built sparse-optimized profiles for {len(self.user_profiles)} users.")
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
-        """
-        Вычисление скоров с использованием чистого SciPy Sparse indeksiranja.
-        """
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
         
@@ -484,6 +471,7 @@ class ContentBasedRecommender:
         top_rated_count: int = 5,
         reasons_count: int = 3
     ) -> None:
+
         movie_titles = dict(zip(movies_df['movieId'], movies_df['title']))
         
         print("=" * 80)
@@ -520,6 +508,9 @@ class ContentBasedRecommender:
         print("=" * 80)
         
         watched_items = set(user_history['movieId'].values)
+        
+        liked_items = set(user_history[user_history['rating'] >= 4.0]['movieId'].values)
+        
         recommendations = self.get_top_k_with_titles(user_id, watched_items, k)
         
         if not recommendations:
@@ -534,7 +525,7 @@ class ContentBasedRecommender:
             print(f"\n{i:2}. {rec_title}")
             print(f"    Predicted Relevance Score: {rec_score:.4f}")
             
-            reasons = self.explain_recommendation(user_id, rec_id, top_n_reasons=reasons_count)
+            reasons = self.explain_recommendation(rec_id, liked_items, top_n_reasons=reasons_count)
             
             if reasons:
                 print(f"    Recommended because you liked:")
@@ -548,7 +539,7 @@ class ContentBasedRecommender:
                     
                     print(f"       - {reason_title}{rating_str} [Similarity: {similarity:.4f}]")
             else:
-                print("    (No specific reasons found in watch history)")
+                print("    (No specific reasons found in your watch history)")
                 
         print("\n" + "=" * 80)
     
@@ -743,18 +734,26 @@ class ContentBasedRecommender:
     
     def explain_recommendation(
         self,
-        user_id: int,
         movie_id: int,
+        liked_items: set,
         top_n_reasons: int = 3
     ) -> List[Dict[str, Any]]:
-        if user_id not in self.user_profiles:
-            return []
-        
         if movie_id not in self.movie_id_to_idx:
             return []
         
-        #movie_idx = self.movie_id_to_idx[movie_id]
+        movie_idx = self.movie_id_to_idx[movie_id]
+        reasons = []
         
-        similar = self.get_similar_movies(movie_id, top_n=top_n_reasons)
-        
-        return similar
+        for liked_id in liked_items:
+            if liked_id in self.movie_id_to_idx:
+                liked_idx = self.movie_id_to_idx[liked_id]
+                sim = self.similarity_matrix[movie_idx, liked_idx]
+                
+                if sim > 0:
+                    reasons.append({
+                        'movie_id': liked_id,
+                        'similarity': float(sim)
+                    })
+                    
+        reasons.sort(key=lambda x: x['similarity'], reverse=True)
+        return reasons[:top_n_reasons]
