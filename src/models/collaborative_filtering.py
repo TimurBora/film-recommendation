@@ -7,8 +7,11 @@ MIN_RATING = 0.5
 MAX_RATING = 5.0
 
 class CollaborativeFiltering:
-    def __init__(self, k_components: int = 50, random_state: int = 42) -> None:
+    def __init__(self, k_components: int = 50, reg_all: float = 0.1, alpha: float = 0.2, min_ratings: int = 15, random_state: int = 42) -> None:
         self.n_components = k_components
+        self.reg_all = reg_all
+        self.alpha = alpha
+        self.min_ratings = min_ratings
         self.random_state = random_state
         self.svd_model: Optional[SVD] = None
         self.trainset = None
@@ -20,12 +23,15 @@ class CollaborativeFiltering:
         self._qi: np.ndarray = np.array([])
         self._bu: np.ndarray = np.array([])
         self._bi: np.ndarray = np.array([])
+        self._item_popularity: np.ndarray = np.array([])
+        self._valid_item_mask: np.ndarray = np.array([])
         self._global_mean: float = 0.0
         self._popular_movies: List[int] = []
 
     def fit(self, df_ratings: pd.DataFrame) -> "CollaborativeFiltering":
-        popularity = df_ratings.groupby("movieId").size().sort_values(ascending=False)
-        self._popular_movies = popularity.index.tolist()
+        popularity_series = df_ratings.groupby("movieId").size()
+        filtered_popularity = popularity_series[popularity_series >= self.min_ratings]
+        self._popular_movies = filtered_popularity.sort_values(ascending=False).index.tolist()
         
         reader = Reader(rating_scale=(MIN_RATING, MAX_RATING))
         data = Dataset.load_from_df(
@@ -34,7 +40,9 @@ class CollaborativeFiltering:
         self.trainset = data.build_full_trainset()
 
         self.svd_model = SVD(
-            n_factors=self.n_components, random_state=self.random_state
+            n_factors=self.n_components,
+            reg_all=self.reg_all,
+            random_state=self.random_state
         )
         self.svd_model.fit(self.trainset)
 
@@ -48,6 +56,16 @@ class CollaborativeFiltering:
         self._bu = self.svd_model.bu
         self._bi = self.svd_model.bi
         self._global_mean = float(self.svd_model.trainset.global_mean)
+        
+        n_items = self.trainset.n_items
+        self._item_popularity = np.ones(n_items, dtype=float)
+        self._valid_item_mask = np.ones(n_items, dtype=bool)
+        
+        for r_id, i_id in self._raw_to_inner_item.items():
+            pop = float(popularity_series.get(r_id, 0))
+            self._item_popularity[i_id] = max(pop, 1.0)
+            if pop < self.min_ratings:
+                self._valid_item_mask[i_id] = False
         
         return self
 
@@ -81,23 +99,27 @@ class CollaborativeFiltering:
         all_scores = self._global_mean + self._bu[u_inner] + self._bi + np.dot(self._qi, self._pu[u_inner])
         all_scores = np.clip(all_scores, MIN_RATING, MAX_RATING)
 
+        penalized_scores = all_scores / (self._item_popularity ** self.alpha)
+
         watched_inners = [self._raw_to_inner_item[m] for m in watched_movie_ids if m in self._raw_to_inner_item]
         
         mask = np.ones(len(all_scores), dtype=bool)
         if watched_inners:
             mask[watched_inners] = False
 
+        mask = mask & self._valid_item_mask
+
         remaining_inners = np.where(mask)[0]
         if len(remaining_inners) == 0:
             return []
             
-        remaining_scores = all_scores[remaining_inners]
+        remaining_penalized = penalized_scores[remaining_inners]
         
-        top_k = min(top_n, len(remaining_scores))
-        top_indices = np.argsort(-remaining_scores)[:top_k]
+        top_k = min(top_n, len(remaining_penalized))
+        top_indices = np.argsort(-remaining_penalized)[:top_k]
         
         return [
-            (self._inner_to_raw_item[remaining_inners[idx]], float(remaining_scores[idx]))
+            (self._inner_to_raw_item[remaining_inners[idx]], float(all_scores[remaining_inners[idx]]))
             for idx in top_indices
         ]
 
