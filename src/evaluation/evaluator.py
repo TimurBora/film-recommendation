@@ -158,11 +158,10 @@ class RecommendationEvaluator:
                     self._map_at_k(recommendations, relevant, k)
                 )
             
-            user_metrics[max_recommendations]['mrr'].append(
-                self._mrr(recommendations, relevant)
-            )
-            
             for k in k_values:
+                user_metrics[k]['mrr'].append(
+                    self._mrr(recommendations[:k], relevant)
+                )
                 user_metrics[k]['novelty'].append(
                     self._novelty(recommendations[:k])
                 )
