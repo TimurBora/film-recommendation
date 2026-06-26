@@ -5,13 +5,12 @@ from typing import Dict, Tuple, List, Optional, Any
 import logging
 import asyncio
 import aiohttp
+import ast
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MOVIE_LENS_RAW_PATH = Path("data/raw/movielens/")
-
-
 TMDB_API_KEY = "99b5221ca8d50de2f0a8aaa057a2b86d"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
@@ -20,45 +19,34 @@ async def fetch_tmdb_movie_data(session: aiohttp.ClientSession, tmdb_id: int) ->
     params = {
         "api_key": TMDB_API_KEY,
         "append_to_response": "credits,keywords",
-        
     }
-    
     try:
         async with session.get(url, params=params, timeout=7) as response:
             if response.status == 429:
                 retry_after = int(response.headers.get("Retry-After", 1))
                 await asyncio.sleep(retry_after)
                 return await fetch_tmdb_movie_data(session, tmdb_id)
-                
             if response.status != 200:
                 return None
-                
             return await response.json()
-    except Exception as e:
-        #logger.debug(f"Error fetching TMDB data for ID {tmdb_id}: {e}")
+    except Exception:
         return None
-
 
 async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
     if pd.isna(row.tmdbId):
         return None
-        
     async with semaphore:
         data = await fetch_tmdb_movie_data(session, int(row.tmdbId))
         if not data:
             return None
-            
         try:
             credits_data = data.get('credits', {})
-            
             cast_list = credits_data.get('cast', [])
             crew_list = credits_data.get('crew', [])
             vote_count = data.get('vote_count')
             fullcast = [c['name'] for c in cast_list[:5] if 'name' in c]
             main_actor = fullcast[0] if fullcast else None
-            
             director_name = next((c['name'] for c in crew_list if c.get('job') == 'Director'), None)
-            
             year = data.get('release_date', '').split('-')[0] if data.get('release_date') else None
             keywords_wrapper = data.get('keywords', {})
             keywords_list = keywords_wrapper.get('keywords', [])
@@ -80,8 +68,9 @@ async def process_single_row(session: aiohttp.ClientSession, row: Any, semaphore
             return None
 
 class MovieLensDataLoader:
-    def __init__(self, data_path: str = "ml-latest-small"):
+    def __init__(self, data_path: str = "ml-latest-small", cache_file: str = "data/processed/movie_metadata.csv"):
         self.data_path = Path(MOVIE_LENS_RAW_PATH / data_path)
+        self.cache_path = Path(cache_file)
         self.movies_df = None
         self.ratings_df = None
         self.tags_df = None
@@ -110,10 +99,8 @@ class MovieLensDataLoader:
     def preprocess_movies(self) -> pd.DataFrame:
         if self.movies_df is None:
             raise ValueError("Movies data not loaded. Call load_data() first.")
-        
         genre_dummies = self.movies_df["genres"].str.get_dummies(sep='|')
         genre_dummies.columns = [f"genre_{col.lower()}" for col in genre_dummies.columns]
-        
         self.genre_matrix = genre_dummies.values.astype(float)
         return genre_dummies
     
@@ -146,13 +133,20 @@ class MovieLensDataLoader:
         return train_ratings, test_ratings
 
     async def letterboxd_data_async(self, max_concurrent_requests: int = 100):
+        if self.cache_path.exists():
+            logger.info(f"Loading data from cache: {self.cache_path}")
+            cached_df = pd.read_csv(self.cache_path)
+            for col in ['cast', 'keywords']:
+                if col in cached_df.columns:
+                    cached_df[col] = cached_df[col].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith('[') else x)
+            self.movie_data = cached_df.to_dict(orient='records')
+            return
+
         if self.links_df is None:
             raise ValueError("Links data not loaded. Call load_data() first.")
             
         rows = list(self.links_df.itertuples())
         self.movie_data = []
-        
-        logger.info(f"{len(rows)} films...")
         
         semaphore = asyncio.Semaphore(max_concurrent_requests)
         connector = aiohttp.TCPConnector(limit=max_concurrent_requests, ttl_dns_cache=300)
@@ -162,7 +156,13 @@ class MovieLensDataLoader:
             results = await asyncio.gather(*tasks)
             
         self.movie_data = [r for r in results if r is not None]
-        logger.info(f"Successfully fetched from API: {len(self.movie_data)} films.")
+        
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df_to_save = pd.DataFrame(self.movie_data)
+            df_to_save.to_csv(self.cache_path, index=False)
+        except Exception as e:
+            logger.error(f"Error saving cache to disk: {e}")
 
     def get_genre_matrix(self) -> np.ndarray:
         if self.genre_matrix is None:
