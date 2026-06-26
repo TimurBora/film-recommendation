@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple, Dict, Any
 from surprise import SVD, Dataset, Reader
 from sklearn.metrics.pairwise import cosine_similarity
 
-MIN_RATING = 1.0
+MIN_RATING = 0.5
 MAX_RATING = 5.0
 
 
