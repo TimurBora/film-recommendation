@@ -5,10 +5,10 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from scipy.sparse import hstack, csr_matrix
-from sklearn.preprocessing import MinMaxScaler, QuantileTransformer
+from scipy.sparse import hstack, csr_matrix, vstack, save_npz, load_npz
+from sklearn.preprocessing import MinMaxScaler, QuantileTransformer, normalize
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -20,21 +20,19 @@ class ContentBasedConfig:
     keywords_weight: float = 0.60
     genre_weight: float = 0.15
     numerical_weight: float = 0.30
-    
     tfidf_sublinear_tf: bool = True
     tfidf_max_features: Optional[int] = None
-    
+
     runtime_clip_percentiles: tuple = (0.01, 0.99)
     year_n_quantiles: int = 1000
-    
+
     similarity_threshold: float = 0.1
     top_k_default: int = 10
-    
+
     artifacts_dir: str = "data/processed/artifacts"
     fillna_strategy: str = "median"
 
-
-class ContentBasedRecommender:    
+class ContentBasedRecommender:
     def __init__(self, config: Optional[ContentBasedConfig] = None):
         self.config = config or ContentBasedConfig()
         self.tfidf_keywords = None
@@ -46,9 +44,9 @@ class ContentBasedRecommender:
         self.scaler_main_actor_rating = None
         self.scaler_director_rating = None
         self.qt_year = None
-        
         self.similarity_matrix = None
         self.feature_matrix = None
+        self.feature_matrix_norm = None
         self.movie_id_to_idx = {}
         self.idx_to_movie_id = {}
         self.all_movie_ids = set()
@@ -61,33 +59,32 @@ class ContentBasedRecommender:
         self.is_fitted = False
 
     @staticmethod
-    def _clean_text(x: Any) -> Any:
-        if isinstance(x, str):
-            return x.lower().replace(' ', '')
-        elif isinstance(x, (list, tuple, np.ndarray)):
-            return [str(i).lower().replace(' ', '') for i in x if i]
-        return ""
-    
+    def _clean_text_series(series: pd.Series) -> pd.Series:
+        return series.fillna("").astype(str).str.lower().str.replace(' ', '', regex=False)
+
     @staticmethod
-    def _weight_cast_members(cast_list: Any, max_weight: int = 3) -> str:
+    def _weight_cast_members_fast(cast_list: Any, max_weight: int = 3) -> str:
         if not isinstance(cast_list, (list, tuple, np.ndarray)):
-            return str(cast_list) if cast_list else ""
-    
+            return str(cast_list).lower().replace(' ', '') if cast_list else ""
+        
         weighted_cast = []
         for i, actor in enumerate(cast_list):
             weight = max(1, max_weight - i)
-            weighted_cast.extend([str(actor)] * weight)
-        weighted_cast = ContentBasedRecommender._clean_text(weighted_cast)
+            actor_clean = str(actor).lower().replace(' ', '')
+            if actor_clean:
+                weighted_cast.extend([actor_clean] * weight)
         return ' '.join(weighted_cast)
-    
+
     def _preprocess_numerical_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         
-        median_runtime = df["runtime"].replace(0, np.nan).median()
-        df["runtime"] = df["runtime"].replace({0: median_runtime, np.nan: median_runtime})
-        lower_bound = df["runtime"].quantile(self.config.runtime_clip_percentiles[0])
-        upper_bound = df["runtime"].quantile(self.config.runtime_clip_percentiles[1])
-        df["runtime"] = df["runtime"].clip(lower_bound, upper_bound)
+        runtime_vals = df["runtime"].replace(0, np.nan)
+        median_runtime = runtime_vals.median()
+        df["runtime"] = runtime_vals.fillna(median_runtime)
+        
+        bounds = df["runtime"].quantile(list(self.config.runtime_clip_percentiles)).values
+        df["runtime"] = df["runtime"].clip(bounds[0], bounds[1])
+        
         self.scaler_runtime = MinMaxScaler()
         df["runtime"] = self.scaler_runtime.fit_transform(df[["runtime"]])
         
@@ -108,7 +105,7 @@ class ContentBasedRecommender:
         df["vote_count"] = qt.fit_transform(df[["vote_count"]].astype(float))
         
         return df
-    
+
     def _preprocess_actor_director_ratings(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         
@@ -143,42 +140,36 @@ class ContentBasedRecommender:
             df['director_rating'] = 0.0
             
         return df
-    
-    def _build_feature_matrix(self, df: pd.DataFrame) -> csr_matrix:
-        self.tfidf_main_actor = TfidfVectorizer(
-            sublinear_tf=self.config.tfidf_sublinear_tf,
-            max_features=self.config.tfidf_max_features
-        )
-        main_actor_tfidf = self.tfidf_main_actor.fit_transform(
-            df["main_actor"].fillna("").apply(self._clean_text)
-        )
-        
-        self.tfidf_director = TfidfVectorizer(
-            sublinear_tf=self.config.tfidf_sublinear_tf,
-            max_features=self.config.tfidf_max_features
-        )
-        director_tfidf = self.tfidf_director.fit_transform(
-            df["director"].fillna("").apply(self._clean_text)
-        )
-        
-        self.tfidf_cast = TfidfVectorizer(
-            sublinear_tf=self.config.tfidf_sublinear_tf,
-            max_features=self.config.tfidf_max_features
-        )
-        cast_weighted = df["cast"].apply(
-            lambda x: self._weight_cast_members(x) if isinstance(x, (list, tuple, np.ndarray)) else str(x)
-        )
-        cast_tfidf = self.tfidf_cast.fit_transform(cast_weighted)
 
-        self.tfidf_keywords = TfidfVectorizer(
+    def _fit_transform_tfidf(self, data: pd.Series, weight: float) -> tuple:
+        vectorizer = TfidfVectorizer(
             sublinear_tf=self.config.tfidf_sublinear_tf,
             max_features=self.config.tfidf_max_features
         )
-        keywords_cleaned = df["keywords"].apply(
-            lambda x: ' '.join(self._clean_text(x)) if isinstance(x, (list, tuple, np.ndarray)) else ""
-        )
-        keywords_tfidf = self.tfidf_keywords.fit_transform(keywords_cleaned)
+        matrix = vectorizer.fit_transform(data)
+        return vectorizer, matrix * weight
+
+    def _build_feature_matrix(self, df: pd.DataFrame) -> csr_matrix:
+        main_actor_clean = self._clean_text_series(df["main_actor"])
+        director_clean = self._clean_text_series(df["director"])
+        cast_weighted = df["cast"].apply(self._weight_cast_members_fast)
         
+        keywords_cleaned = df["keywords"].apply(
+            lambda x: ' '.join([str(i).lower().replace(' ', '') for i in x if i]) 
+            if isinstance(x, (list, tuple, np.ndarray)) else ""
+        )
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            f_actor = executor.submit(self._fit_transform_tfidf, main_actor_clean, self.config.main_actor_weight)
+            f_director = executor.submit(self._fit_transform_tfidf, director_clean, self.config.director_weight)
+            f_cast = executor.submit(self._fit_transform_tfidf, cast_weighted, self.config.cast_weight)
+            f_keywords = executor.submit(self._fit_transform_tfidf, keywords_cleaned, self.config.keywords_weight)
+            
+            self.tfidf_main_actor, main_actor_tfidf = f_actor.result()
+            self.tfidf_director, director_tfidf = f_director.result()
+            self.tfidf_cast, cast_tfidf = f_cast.result()
+            self.tfidf_keywords, keywords_tfidf = f_keywords.result()
+
         numerical_features = df[[
             'runtime', 
             'year', 
@@ -186,17 +177,13 @@ class ContentBasedRecommender:
             'director_rating',
             'vote_count'
         ]].values
-        numerical_matrix = csr_matrix(numerical_features)
+        numerical_matrix = csr_matrix(numerical_features) * self.config.numerical_weight
 
         genre_cols = [col for col in df.columns if col.startswith("genre_")]
-        genre_matrix = csr_matrix(df[genre_cols].values.astype(float))
-        
-        main_actor_tfidf = main_actor_tfidf * self.config.main_actor_weight
-        director_tfidf = director_tfidf * self.config.director_weight
-        cast_tfidf = cast_tfidf * self.config.cast_weight
-        keywords_tfidf = keywords_tfidf * self.config.keywords_weight
-        genre_matrix = genre_matrix * self.config.genre_weight
-        numerical_matrix = numerical_matrix * self.config.numerical_weight
+        if genre_cols:
+            genre_matrix = csr_matrix(df[genre_cols].values.astype(float)) * self.config.genre_weight
+        else:
+            genre_matrix = csr_matrix((df.shape[0], 0))
         
         combined_features = hstack([
             main_actor_tfidf,
@@ -208,28 +195,23 @@ class ContentBasedRecommender:
         ]).tocsr()
         
         return combined_features
-    
-    def _compute_similarity_matrix(self, features: csr_matrix, batch_size: int = 2000) -> csr_matrix:
-        n_samples = features.shape[0]
-        rows = []
-        cols = []
-        data = []
+
+    def _compute_similarity_matrix(self, features_norm: csr_matrix, batch_size: int = 5000) -> csr_matrix:
+        n_samples = features_norm.shape[0]
+        results = []
         
         for i in range(0, n_samples, batch_size):
             end = min(i + batch_size, n_samples)
-            batch = features[i:end]
-            sim_batch = cosine_similarity(batch, features)
+            batch = features_norm[i:end]
             
-            sim_batch[sim_batch < self.config.similarity_threshold] = 0
+            sim_batch = batch.dot(features_norm.T)
             
-            batch_rows, batch_cols = np.nonzero(sim_batch)
-            for r, c in zip(batch_rows, batch_cols):
-                rows.append(i + r)
-                cols.append(c)
-                data.append(sim_batch[r, c])
+            sim_batch.data[sim_batch.data < self.config.similarity_threshold] = 0
+            sim_batch.eliminate_zeros()
+            results.append(sim_batch)
                 
-        return csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples), dtype=np.float32)
-    
+        return vstack(results)
+
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
         required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
         missing_cols = [col for col in required_cols if col not in movies_df.columns]
@@ -241,7 +223,9 @@ class ContentBasedRecommender:
         
         features_matrix = self._build_feature_matrix(df_processed)
         self.feature_matrix = features_matrix
-        self.similarity_matrix = self._compute_similarity_matrix(features_matrix)
+        self.feature_matrix_norm = normalize(features_matrix, norm='l2', axis=1)
+        
+        self.similarity_matrix = self._compute_similarity_matrix(self.feature_matrix_norm)
         
         self.movie_id_to_idx = {
             mid: idx for idx, mid in enumerate(df_processed['movieId'].values)
@@ -265,28 +249,31 @@ class ContentBasedRecommender:
         return self
 
     def _build_user_profiles(self, ratings_df: pd.DataFrame):
-        self.user_profiles = {}
         good_ratings_df = ratings_df[ratings_df['rating'] >= 4.0]
-        valid_df = good_ratings_df[good_ratings_df['movieId'].isin(self.movie_id_to_idx)].copy()
+        valid_df = good_ratings_df[good_ratings_df['movieId'].isin(self.all_movie_ids)].copy()
         
         if valid_df.empty:
+            self.user_profiles = {}
             return
             
-        valid_df['movie_idx'] = valid_df['movieId'].map(self.movie_id_to_idx)
+        unique_users = valid_df['userId'].unique()
+        user_id_to_idx = {uid: i for i, uid in enumerate(unique_users)}
         
-        for user_id, group in valid_df.groupby('userId'):
-            idxs = group['movie_idx'].values
-            weights = group['rating'].values.astype(np.float32)
-            
-            user_features_sparse = self.feature_matrix[idxs]
-            profile_sparse = csr_matrix(weights).dot(user_features_sparse)
-            profile = np.asarray(profile_sparse.todense()).reshape(-1)
-            
-            norm = np.linalg.norm(profile)
-            if norm > 0:
-                profile = profile / norm
-                
-            self.user_profiles[user_id] = profile
+        row_ind = valid_df['userId'].map(user_id_to_idx).values
+        col_ind = valid_df['movieId'].map(self.movie_id_to_idx).values
+        data = valid_df['rating'].values.astype(np.float32)
+        
+        user_item_matrix = csr_matrix(
+            (data, (row_ind, col_ind)), 
+            shape=(len(unique_users), len(self.movie_id_to_idx))
+        )
+        
+        profiles_sparse = user_item_matrix.dot(self.feature_matrix)
+        profiles_normalized = normalize(profiles_sparse, norm='l2', axis=1)
+        
+        self.user_profiles = {
+            uid: profiles_normalized[idx] for uid, idx in user_id_to_idx.items()
+        }
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
         if not self.is_fitted:
@@ -296,6 +283,7 @@ class ContentBasedRecommender:
             return self._predict_popularity_scores(item_ids)
         
         profile = self.user_profiles[user_id]
+        
         valid_candidates = [
             (i, mid) for i, mid in enumerate(item_ids)
             if mid in self.movie_id_to_idx
@@ -304,28 +292,19 @@ class ContentBasedRecommender:
         scores = np.zeros(len(item_ids), dtype=np.float32)
         
         if valid_candidates:
-            cand_indices = np.array([
-                self.movie_id_to_idx[mid] for _, mid in valid_candidates
-            ])
-            cand_vectors_sparse = self.feature_matrix[cand_indices]
-            dots = cand_vectors_sparse.dot(profile)
+            cand_indices = np.array([self.movie_id_to_idx[mid] for _, mid in valid_candidates])
+            cand_vectors_norm = self.feature_matrix_norm[cand_indices]
             
-            cand_norms = np.sqrt(np.asarray(cand_vectors_sparse.power(2).sum(axis=1))).reshape(-1)
-            profile_norm = np.linalg.norm(profile)
-            norms = cand_norms * profile_norm
-            
-            mask = norms > 0
-            valid_scores = np.zeros_like(dots)
-            valid_scores[mask] = dots[mask] / norms[mask]
+            dots = cand_vectors_norm.dot(profile.T).toarray().flatten()
             
             for i, (orig_idx, mid) in enumerate(valid_candidates):
-                pure = valid_scores[i] 
+                pure = dots[i]
                 pop = self.movie_vote_counts.get(mid, 0.0)
                 soft_popularity = 0.35 + (0.65 * pop)
                 scores[orig_idx] = pure * soft_popularity
                 
         return scores.tolist()
-    
+
     def _predict_popularity_scores(self, item_ids: List[int]) -> List[float]:
         scores = []
         for mid in item_ids:
@@ -338,7 +317,7 @@ class ContentBasedRecommender:
                 scores = [s / max_score for s in scores]
         
         return scores
-    
+
     def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = None) -> List[int]:
         if k is None:
             k = self.config.top_k_default
@@ -352,7 +331,7 @@ class ContentBasedRecommender:
         scored_items.sort(reverse=True, key=lambda x: x[0])
         
         return [mid for score, mid in scored_items[:k]]
-    
+
     def get_top_k_with_titles(self, user_id: int, watched_items: set, k: int = None) -> List[Dict[str, Any]]:
         if k is None:
             k = self.config.top_k_default
@@ -448,7 +427,7 @@ class ContentBasedRecommender:
                 print("    (No specific reasons found in your watch history)")
                 
         print("\n" + "=" * 80)
-    
+
     def save_artifacts(
         self,
         similarity_path: Optional[str] = None,
@@ -465,7 +444,6 @@ class ContentBasedRecommender:
         mapping_path = mapping_path or str(artifacts_dir / "movie_id_to_idx.pkl")
         preprocessors_path = preprocessors_path or str(artifacts_dir / "preprocessors.pkl")
         
-        from scipy.sparse import save_npz
         save_npz(similarity_path, self.similarity_matrix)
         
         with open(mapping_path, 'wb') as f:
@@ -485,9 +463,11 @@ class ContentBasedRecommender:
                 'scaler_main_actor_rating': self.scaler_main_actor_rating,
                 'scaler_director_rating': self.scaler_director_rating,
                 'qt_year': self.qt_year,
-                'config': self.config
+                'config': self.config,
+                'feature_matrix': self.feature_matrix,
+                'user_profiles': self.user_profiles
             }, f)
-    
+
     def load_artifacts(
         self,
         similarity_path: Optional[str] = None,
@@ -504,7 +484,6 @@ class ContentBasedRecommender:
             dense_matrix = np.load(similarity_path, allow_pickle=True)
             self.similarity_matrix = csr_matrix(dense_matrix)
         else:
-            from scipy.sparse import load_npz
             self.similarity_matrix = load_npz(similarity_path)
         
         with open(mapping_path, 'rb') as f:
@@ -524,9 +503,15 @@ class ContentBasedRecommender:
             self.scaler_director_rating = preprocessors['scaler_director_rating']
             self.qt_year = preprocessors['qt_year']
             self.config = preprocessors['config']
+            
+            self.feature_matrix = preprocessors.get('feature_matrix', None)
+            if self.feature_matrix is not None:
+                self.feature_matrix_norm = normalize(self.feature_matrix, norm='l2', axis=1)
+            
+            self.user_profiles = preprocessors.get('user_profiles', {})
         
         self.is_fitted = True
-    
+
     def get_similar_movies(self, movie_id: int, top_n: int = 10) -> List[Dict[str, Any]]:
         if movie_id not in self.movie_id_to_idx:
             return []
@@ -552,7 +537,7 @@ class ContentBasedRecommender:
             })
         
         return results
-    
+
     def explain_recommendation(
         self,
         movie_id: int,
@@ -563,18 +548,21 @@ class ContentBasedRecommender:
             return []
         
         movie_idx = self.movie_id_to_idx[movie_id]
-        reasons = []
+        liked_idxs = [self.movie_id_to_idx[lid] for lid in liked_items if lid in self.movie_id_to_idx]
         
-        for liked_id in liked_items:
-            if liked_id in self.movie_id_to_idx:
-                liked_idx = self.movie_id_to_idx[liked_id]
-                sim = self.similarity_matrix[movie_idx, liked_idx]
-                
-                if sim > 0:
-                    reasons.append({
-                        'movie_id': liked_id,
-                        'similarity': float(sim)
-                    })
+        if not liked_idxs:
+            return []
+            
+        row = self.similarity_matrix[movie_idx]
+        sims = row[:, liked_idxs].toarray()[0]
+        
+        reasons = []
+        for lid, sim in zip(liked_idxs, sims):
+            if sim > 0:
+                reasons.append({
+                    'movie_id': self.idx_to_movie_id[lid],
+                    'similarity': float(sim)
+                })
                     
         reasons.sort(key=lambda x: x['similarity'], reverse=True)
         return reasons[:top_n_reasons]

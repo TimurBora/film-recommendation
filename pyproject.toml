@@ -12,6 +12,7 @@ dependencies = [
     "jupyter",
     "letterboxdpy",
     "matplotlib",
+    "numba>=0.65.1",
     "numpy",
     "orjson>=3.11.9",
     "pandas",
