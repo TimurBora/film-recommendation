@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 import pickle
-import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -9,30 +8,12 @@ from scipy.sparse import hstack, csr_matrix, vstack, save_npz, load_npz
 from sklearn.preprocessing import MinMaxScaler, QuantileTransformer, normalize
 from sklearn.feature_extraction.text import TfidfVectorizer
 from concurrent.futures import ThreadPoolExecutor
-import os
 import time
 import psutil
+import os
 from loguru import logger
 from tqdm import tqdm
-
-@dataclass
-class LoggingConfig:
-    # Record elapsed wall-clock time for each step
-    log_wall_time: bool = True
-    # Record CPU time (process time) spent on the step
-    log_cpu_time: bool = True
-    # Record Resident Set Size – actual physical memory used by the process
-    log_memory_rss: bool = True
-    # Record Virtual Memory Size – total virtual memory allocated
-    log_memory_vms: bool = True
-    # Record the change in RSS from the previous logged step
-    log_memory_delta: bool = True
-    # Record the CPU usage percentage of the current process (snapshot)
-    log_cpu_percent: bool = True
-    # Log shapes and densities of internal matrices after fitting
-    log_data_shapes: bool = True
-    # Show tqdm progress bars during heavy operations (similarity matrix, etc.)
-    show_progress_bars: bool = True
+from src.utils.logger import LoggingConfig, StepLogger
 
 @dataclass
 class ContentBasedConfig:
@@ -54,7 +35,7 @@ class ContentBasedConfig:
     artifacts_dir: str = "data/processed/artifacts"
     fillna_strategy: str = "median"
 
-    logging: LoggingConfig = field(default_factory=LoggingConfig)   # <-- fix
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 class ContentBasedRecommender:
     def __init__(self, config: Optional[ContentBasedConfig] = None):
@@ -81,42 +62,7 @@ class ContentBasedRecommender:
         self.movie_vote_counts = {}
 
         self.is_fitted = False
-        self._prev_memory = None
-
-    def _log_step(self, step_name: str, start_time: float, start_cpu: float, extra_metrics: dict = None):
-        """
-        Log a processing step with optional performance and memory metrics.
-        Output is formatted as a multi-line block for readability.
-        """
-        now = time.perf_counter()
-        cpu_now = time.process_time()
-        mem = psutil.Process(os.getpid()).memory_info()
-        cpu_percent = psutil.Process(os.getpid()).cpu_percent(interval=None)
-
-        lines = [f"--- Step: {step_name} ---"]
-
-        if self.config.logging.log_wall_time:
-            lines.append(f"  Wall clock time : {now - start_time:.2f} s")
-        if self.config.logging.log_cpu_time:
-            lines.append(f"  CPU time (user) : {cpu_now - start_cpu:.2f} s")
-        if self.config.logging.log_memory_rss:
-            lines.append(f"  Memory RSS      : {mem.rss / (1024*1024):.1f} MB")
-        if self.config.logging.log_memory_vms:
-            lines.append(f"  Memory VMS      : {mem.vms / (1024*1024):.1f} MB")
-        if self.config.logging.log_memory_delta and self._prev_memory is not None:
-            delta = (mem.rss - self._prev_memory) / (1024*1024)
-            lines.append(f"  RSS change      : {delta:+.1f} MB")
-        if self.config.logging.log_cpu_percent:
-            lines.append(f"  CPU usage       : {cpu_percent:.1f} %")
-
-        if extra_metrics:
-            for k, v in extra_metrics.items():
-                lines.append(f"  {k.ljust(15)} : {v}")
-
-        self._prev_memory = mem.rss
-
-        # Loguru normally adds its own formatting; using .opt(raw=True) prints exactly what we give it.
-        logger.opt(raw=True).info("\n".join(lines) + "\n")
+        self.step_logger = StepLogger(self.config.logging)
 
     @staticmethod
     def _clean_text_series(series: pd.Series) -> pd.Series:
@@ -262,33 +208,32 @@ class ContentBasedRecommender:
     def fit(self, movies_df: pd.DataFrame, ratings_df: Optional[pd.DataFrame] = None) -> 'ContentBasedRecommender':
         total_start = time.perf_counter()
         total_cpu = time.process_time()
-        self._prev_memory = psutil.Process(os.getpid()).memory_info().rss
         logger.info("Starting model fitting process")
 
         required_cols = ['movieId', 'main_actor', 'director', 'cast', 'runtime', 'year', 'keywords']
         missing_cols = [col for col in required_cols if col not in movies_df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns in movies_df: {missing_cols}")
-        self._log_step("Validation", total_start, total_cpu)
+        self.step_logger.log_step("Validation", total_start, total_cpu)
 
         df_processed = self._preprocess_numerical_features(movies_df.copy())
         df_processed = self._preprocess_actor_director_ratings(df_processed)
-        self._log_step("Preprocessing", total_start, total_cpu)
+        self.step_logger.log_step("Preprocessing", total_start, total_cpu)
 
         features_matrix = self._build_feature_matrix(df_processed)
         self.feature_matrix = features_matrix
         self.feature_matrix_norm = normalize(features_matrix, norm='l2', axis=1)
-        self._log_step("Feature Matrix", total_start, total_cpu)
+        self.step_logger.log_step("Feature Matrix", total_start, total_cpu)
 
         self.similarity_matrix = self._compute_similarity_matrix(self.feature_matrix_norm)
-        self._log_step("Similarity Matrix", total_start, total_cpu)
+        self.step_logger.log_step("Similarity Matrix", total_start, total_cpu)
 
         self.movie_id_to_idx = {
             mid: idx for idx, mid in enumerate(df_processed['movieId'].values)
         }
         self.idx_to_movie_id = {idx: mid for mid, idx in self.movie_id_to_idx.items()}
         self.all_movie_ids = set(self.movie_id_to_idx.keys())
-        self._log_step("Index Mappings", total_start, total_cpu)
+        self.step_logger.log_step("Index Mappings", total_start, total_cpu)
 
         if ratings_df is not None:
             self._build_user_profiles(ratings_df)
@@ -300,7 +245,7 @@ class ContentBasedRecommender:
         self.movie_vote_counts = dict(zip(df_processed['movieId'], df_processed['vote_count']))
         if 'title' in movies_df.columns:
             self.movie_id_to_title = dict(zip(movies_df['movieId'], movies_df['title']))
-        self._log_step("User Profiles & Metadata", total_start, total_cpu)
+        self.step_logger.log_step("User Profiles & Metadata", total_start, total_cpu)
 
         self.is_fitted = True
 
@@ -472,7 +417,6 @@ class ContentBasedRecommender:
             raise RuntimeError("Model must be fitted before saving artifacts.")
         start = time.perf_counter()
         cpu_start = time.process_time()
-        self._prev_memory = psutil.Process(os.getpid()).memory_info().rss
 
         artifacts_dir = Path(self.config.artifacts_dir)
         artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -510,7 +454,7 @@ class ContentBasedRecommender:
             "mapping_file": str(Path(mapping_path).name),
             "preprocessors_file": str(Path(preprocessors_path).name)
         }
-        self._log_step("SaveArtifacts", start, cpu_start, extra)
+        self.step_logger.log_step("SaveArtifacts", start, cpu_start, extra)
 
     def load_artifacts(
         self,
@@ -520,7 +464,6 @@ class ContentBasedRecommender:
     ):
         start = time.perf_counter()
         cpu_start = time.process_time()
-        self._prev_memory = psutil.Process(os.getpid()).memory_info().rss
 
         artifacts_dir = Path(self.config.artifacts_dir)
         similarity_path = similarity_path or str(artifacts_dir / "similarity_matrix.npz")
@@ -561,7 +504,7 @@ class ContentBasedRecommender:
             "mapping_file": str(Path(mapping_path).name),
             "preprocessors_file": str(Path(preprocessors_path).name)
         }
-        self._log_step("LoadArtifacts", start, cpu_start, extra)
+        self.step_logger.log_step("LoadArtifacts", start, cpu_start, extra)
 
     def get_similar_movies(self, movie_id: int, top_n: int = 10) -> List[Dict[str, Any]]:
         if movie_id not in self.movie_id_to_idx:
