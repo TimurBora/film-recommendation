@@ -95,11 +95,15 @@ def _cb_score_matrix(cb: Any, user_ids: List[int], item_ids: np.ndarray) -> np.n
     if gu.size and cb.user_profiles is not None:
         profiles = cb.user_profiles[ul[gu]]
         feats = cb.feature_matrix_norm[vi_in]
-        dots = (profiles @ feats.T).toarray().astype(np.float32)
+        dots = profiles @ feats.T
+        if sp.issparse(dots):
+            dots = dots.toarray()
+        else:
+            dots = np.asarray(dots)
+        dots = dots.astype(np.float32)
         out[np.ix_(gu, vi)] = dots * cb.soft_pop_arr[vi_in][None, :]
 
     return out
-
 
 def _apply_topk(
     scores: np.ndarray,

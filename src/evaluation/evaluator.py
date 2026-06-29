@@ -1,17 +1,16 @@
-import time
-import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Iterable
-from tqdm import tqdm
+import pandas as pd
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
+import time
+import os
+import inspect
 from loguru import logger
+from tqdm import tqdm
 
-try:
-    import cupy as cp
-    HAS_GPU = True
-except ImportError:
-    HAS_GPU = False
 
 class RecommendationEvaluator:
+
     def __init__(
         self,
         models: Dict[str, Any],
@@ -20,12 +19,12 @@ class RecommendationEvaluator:
         relevance_threshold: float = 4.0,
         user_sample_size: Optional[int] = None,
         random_state: int = 42,
-        use_gpu: bool = True
+        use_gpu: bool = True,
+        item_universe: Optional[List[int]] = None
     ):
         self.models = models
         self.relevance_threshold = relevance_threshold
         self.random_state = random_state
-        self.use_gpu = use_gpu and HAS_GPU
 
         all_test_users = test_df['userId'].unique()
         if user_sample_size is not None and user_sample_size < len(all_test_users):
@@ -37,115 +36,42 @@ class RecommendationEvaluator:
         self.user_to_idx = {u: i for i, u in enumerate(self.test_users)}
         self.n_test_users = len(self.test_users)
 
-        test_filtered = test_df[test_df['rating'] >= relevance_threshold]
-        rel_dict = test_filtered.groupby('userId')['movieId'].apply(list).to_dict()
-        
+        if item_universe is None:
+            self.item_catalog = sorted(set(train_df['movieId'].unique()) | set(test_df['movieId'].unique()))
+        else:
+            self.item_catalog = sorted(set(item_universe))
+        self.item_index = pd.Index(self.item_catalog)
+        self.item_set = set(self.item_catalog)
+        self.item_catalog_list = list(self.item_catalog)
+        self.n_items = len(self.item_index)
+
+        test_relevant = test_df[test_df['rating'] >= relevance_threshold]
+        self.rel_dict = test_relevant.groupby('userId')['movieId'].apply(list).to_dict()
         self.train_watched_items = train_df.groupby('userId')['movieId'].apply(set).to_dict()
 
-        max_rel_len = max((len(items) for items in rel_dict.values()), default=0)
-        self.padded_rel_items = np.full((self.n_test_users, max_rel_len), -1, dtype=np.int64)
-        self.rel_counts = np.zeros(self.n_test_users, dtype=np.float32)
+        rel_indices = []
+        for u in self.test_users:
+            mids = self.rel_dict.get(u, [])
+            valid_mids = [mid for mid in mids if mid in self.item_set]
+            idxs = self.item_index.get_indexer(valid_mids).astype(np.int32)
+            idxs.sort()
+            rel_indices.append(idxs)
+        self.rel_indices_sorted = rel_indices
+        self.counts_arr = np.array([len(arr) for arr in rel_indices], dtype=np.float64)
 
-        for user_id, idx in self.user_to_idx.items():
-            items = rel_dict.get(user_id, [])
-            n_items = len(items)
-            if n_items > 0:
-                self.padded_rel_items[idx, :n_items] = items
-                self.rel_counts[idx] = n_items
+        item_popularity = train_df['movieId'].value_counts().to_dict()
+        total_interactions = sum(item_popularity.values())
+        default_novelty = -np.log2(1.0 / total_interactions) if total_interactions > 0 else 0.0
 
-        self.all_items = set(test_df['movieId'].unique())
-        self.item_popularity = train_df['movieId'].value_counts().to_dict()
-        total_interactions = sum(self.item_popularity.values())
-
-        max_train_id = train_df['movieId'].max() if not train_df.empty else 0
-        max_test_id = test_df['movieId'].max() if not test_df.empty else 0
-        max_movie_id = int(max(max_train_id, max_test_id))
-
-        self._default_novelty = -np.log2(1.0 / total_interactions) if total_interactions > 0 else 0.0
-        self.novelty_map = np.full(max_movie_id + 2, self._default_novelty, dtype=np.float32)
-        
-        for item, count in self.item_popularity.items():
-            prob = count / total_interactions
-            self.novelty_map[item] = -np.log2(prob) if prob > 0 else self._default_novelty
-            
-        self.novelty_map[-1] = 0.0
-
-        if self.use_gpu:
-            self.padded_rel_items = cp.asarray(self.padded_rel_items)
-            self.rel_counts = cp.asarray(self.rel_counts)
-            self.novelty_map = cp.asarray(self.novelty_map)
-
+        novelty_array = np.zeros(self.n_items, dtype=np.float64)
+        for pos, mid in enumerate(self.item_catalog):
+            cnt = item_popularity.get(mid, 0)
+            if cnt > 0:
+                novelty_array[pos] = -np.log2(cnt / total_interactions)
+            else:
+                novelty_array[pos] = default_novelty
+        self.novelty_array = novelty_array
         self.results = None
-
-    def _chunk_generator(self, iterable: Iterable, size: int):
-        iterator = iter(iterable)
-        for first in iterator:
-            chunk = [first]
-            for _ in range(size - 1):
-                try:
-                    chunk.append(next(iterator))
-                except StopIteration:
-                    break
-            yield chunk
-
-    def _compute_metrics_vectorized(
-        self,
-        recs: Any,
-        u_idx: Any,
-        k_values: List[int],
-        max_k: int
-    ) -> Dict[int, Dict[str, float]]:
-        xp = cp if self.use_gpu else np
-        
-        rels = self.padded_rel_items[u_idx]
-        counts = self.rel_counts[u_idx]
-
-        hits_3d = recs[:, :, None] == rels[:, None, :]
-        rel_mask = xp.any(hits_3d, axis=2)
-
-        discounts = 1.0 / xp.log2(xp.arange(2, max_k + 2, dtype=xp.float32))
-        idcg_cache = xp.concatenate([xp.zeros(1, dtype=xp.float32), xp.cumsum(discounts)])
-
-        novelties = self.novelty_map[recs]
-
-        results = {}
-        for k in k_values:
-            k_idx = min(k, max_k)
-            mask_k = rel_mask[:, :k_idx]
-            disc_k = discounts[:k_idx]
-
-            hits = xp.sum(mask_k, axis=1, dtype=xp.float32)
-            precision = hits / k_idx
-            recall = xp.where(counts > 0, hits / counts, 0.0)
-
-            dcg = xp.sum(mask_k * disc_k, axis=1)
-            ideal_counts = xp.minimum(counts, k_idx).astype(xp.int32)
-            ideal_dcg = idcg_cache[ideal_counts]
-            ndcg = xp.where(ideal_dcg > 0, dcg / ideal_dcg, 0.0)
-
-            cum_hits = xp.cumsum(mask_k, axis=1)
-            positions = xp.arange(1, k_idx + 1, dtype=xp.float32)
-            prec_at_i = cum_hits / positions
-            ap = xp.sum(prec_at_i * mask_k, axis=1)
-            map_score = xp.where(counts > 0, ap / xp.minimum(counts, k_idx), 0.0)
-
-            has_rel = xp.any(mask_k, axis=1)
-            first_rel = xp.argmax(mask_k, axis=1)
-            mrr = xp.where(has_rel, 1.0 / (first_rel.astype(xp.float32) + 1.0), 0.0)
-
-            novelty = xp.mean(novelties[:, :k_idx], axis=1)
-
-            results[k] = {
-                'precision': float(xp.mean(precision).item()),
-                'recall': float(xp.mean(recall).item()),
-                'ndcg': float(xp.mean(ndcg).item()),
-                'map': float(xp.mean(map_score).item()),
-                'mrr': float(xp.mean(mrr).item()),
-                'novelty': float(xp.mean(novelty).item()),
-                'n_users': int(xp.sum(hits > 0).item())
-            }
-            
-        return results
 
     def evaluate_model(
         self,
@@ -157,20 +83,41 @@ class RecommendationEvaluator:
     ) -> List[Dict[str, Any]]:
         logger.info("Evaluating '{}'", model_name)
         start_time = time.time()
-        pad_val = -1
-        k_max = min(max(k_values) if k_values else max_recommendations, max_recommendations)
 
-        recs_arr = np.full((self.n_test_users, max_recommendations), pad_val, dtype=np.int64)
-        
-        has_batch_method = hasattr(model, 'get_top_k_recommendations_batch')
+        n_users = self.n_test_users
+        max_k = max(k_values) if k_values else max_recommendations
+        max_k = min(max_k, max_recommendations)
+        recs_arr = np.full((n_users, max_recommendations), -1, dtype=np.int64)
 
-        for user_chunk in tqdm(self._chunk_generator(self.test_users, batch_size), 
-                               total=(self.n_test_users + batch_size - 1) // batch_size, 
-                               desc=f"{model_name}", leave=False):
-            
-            chunk_indices = [self.user_to_idx[u] for u in user_chunk]
-            
-            if has_batch_method:
+        has_batch = hasattr(model, 'get_top_k_recommendations_batch')
+        supports_valid_items = False
+        if has_batch:
+            sig = inspect.signature(model.get_top_k_recommendations_batch)
+            supports_valid_items = 'valid_items' in sig.parameters
+
+        if has_batch and supports_valid_items:
+            for start in tqdm(range(0, n_users, batch_size), desc=f"{model_name}", leave=False):
+                end = min(start + batch_size, n_users)
+                user_chunk = self.test_users[start:end]
+                chunk_indices = [self.user_to_idx[u] for u in user_chunk]
+                watched_list = [self.train_watched_items.get(u, set()) for u in user_chunk]
+                try:
+                    batch_recs = model.get_top_k_recommendations_batch(
+                        user_ids=user_chunk,
+                        watched_items_list=watched_list,
+                        k=max_recommendations,
+                        valid_items=self.item_catalog_list
+                    )
+                    for i, idx in enumerate(chunk_indices):
+                        row = batch_recs[i][:max_recommendations]
+                        recs_arr[idx, :len(row)] = row
+                except Exception as e:
+                    logger.warning("Batch error for {}: {}", model_name, e)
+        elif has_batch and not supports_valid_items:
+            for start in tqdm(range(0, n_users, batch_size), desc=f"{model_name}", leave=False):
+                end = min(start + batch_size, n_users)
+                user_chunk = self.test_users[start:end]
+                chunk_indices = [self.user_to_idx[u] for u in user_chunk]
                 watched_list = [self.train_watched_items.get(u, set()) for u in user_chunk]
                 try:
                     batch_recs = model.get_top_k_recommendations_batch(
@@ -179,56 +126,123 @@ class RecommendationEvaluator:
                         k=max_recommendations
                     )
                     for i, idx in enumerate(chunk_indices):
-                        r = batch_recs[i][:max_recommendations]
-                        recs_arr[idx, :len(r)] = r
+                        row = [mid for mid in batch_recs[i] if mid in self.item_set][:max_recommendations]
+                        recs_arr[idx, :len(row)] = row
                 except Exception as e:
-                    logger.warning("Batch error: {}", e)
-            else:
-                for u, idx in zip(user_chunk, chunk_indices):
-                    watched = self.train_watched_items.get(u, set())
-                    try:
-                        r = model.get_top_k_recommendations(
+                    logger.warning("Batch error for {}: {}", model_name, e)
+        else:
+            item_catalog_list = self.item_catalog_list
+            def fetch_for_user(u):
+                watched = self.train_watched_items.get(u, set())
+                try:
+                    sig = inspect.signature(model.get_top_k_recommendations)
+                    if 'valid_items' in sig.parameters:
+                        recs = model.get_top_k_recommendations(
+                            user_id=int(u),
+                            watched_items=watched,
+                            k=max_recommendations,
+                            valid_items=item_catalog_list
+                        )
+                    else:
+                        recs = model.get_top_k_recommendations(
                             user_id=int(u),
                             watched_items=watched,
                             k=max_recommendations
                         )
-                        if r:
-                            r = r[:max_recommendations]
-                            recs_arr[idx, :len(r)] = r
-                    except Exception as e:
-                        logger.warning("Error for user {}: {}", u, e)
+                        recs = [mid for mid in recs if mid in self.item_set]
+                    return recs
+                except Exception:
+                    return []
 
-        unique_items = np.unique(recs_arr)
-        unique_count = len(unique_items) - (1 if pad_val in unique_items else 0)
-        coverage = unique_count / len(self.all_items) if self.all_items else 0.0
+            with ThreadPoolExecutor(max_workers=min(32, os.cpu_count())) as executor:
+                future_to_user = {executor.submit(fetch_for_user, u): u for u in self.test_users}
+                for future in tqdm(future_to_user, total=n_users, desc=f"{model_name}", leave=False):
+                    u = future_to_user[future]
+                    idx = self.user_to_idx[u]
+                    row = future.result()[:max_recommendations]
+                    recs_arr[idx, :len(row)] = row
 
-        xp = cp if self.use_gpu else np
-        gpu_recs_arr = xp.asarray(recs_arr)
-        gpu_u_idx = xp.arange(self.n_test_users)
+        recs_idx = self.item_index.get_indexer(recs_arr.ravel()).reshape(recs_arr.shape)
 
-        metrics_dict = self._compute_metrics_vectorized(
-            gpu_recs_arr, gpu_u_idx, k_values, k_max
+        hits = np.zeros((n_users, max_k), dtype=bool)
+        for i in range(n_users):
+            rel_sorted = self.rel_indices_sorted[i]
+            if len(rel_sorted) == 0:
+                continue
+            s = np.searchsorted(rel_sorted, recs_idx[i, :max_k])
+            mask = (s < len(rel_sorted)) & (rel_sorted[s] == recs_idx[i, :max_k])
+            hits[i] = mask
+
+        safe_indices = np.where(recs_idx[:, :max_k] >= 0, recs_idx[:, :max_k], 0)
+        raw_nov = np.take(self.novelty_array, safe_indices, mode='clip')
+        novelty_vals = np.where(recs_idx[:, :max_k] != -1, raw_nov, 0.0)
+
+        discounts = 1.0 / np.log2(np.arange(2, max_k + 2, dtype=np.float64))
+        cum_discounts = np.zeros(max_k + 1, dtype=np.float64)
+        cum_discounts[1:] = np.cumsum(discounts)
+        cumsum_hits = np.cumsum(hits, axis=1).astype(np.float64)
+        positions = np.arange(1, max_k + 1, dtype=np.float64)
+        prec_at_j = cumsum_hits / positions
+        ap_terms = prec_at_j * hits
+        cumsum_ap = np.cumsum(ap_terms, axis=1)
+        dcg_terms = hits * discounts
+        cumsum_dcg = np.cumsum(dcg_terms, axis=1)
+        first_hit_idx = np.argmax(hits, axis=1).astype(np.int32)
+        any_hit = hits.any(axis=1)
+        first_hit_idx[~any_hit] = -1
+
+        min_counts_k = np.minimum(
+            self.counts_arr[:, None],
+            np.arange(1, max_k + 1, dtype=np.float64)[None, :]
         )
+        ideal_dcg = np.where(min_counts_k > 0, cum_discounts[min_counts_k.astype(int)], 0.0)
+
+        valid_recs = recs_arr[recs_arr != -1]
+        unique_recs = np.unique(valid_recs)
+        coverage = len(unique_recs) / self.n_items if self.n_items else 0.0
 
         results = []
         for k in k_values:
-            met = metrics_dict[k]
+            k_idx = min(k, max_k) - 1
+            prec = cumsum_hits[:, k_idx] / k
+            rec = np.divide(
+                cumsum_hits[:, k_idx], self.counts_arr,
+                out=np.zeros_like(self.counts_arr),
+                where=self.counts_arr > 0
+            )
+            dcg = cumsum_dcg[:, k_idx]
+            ndcg = np.divide(
+                dcg, ideal_dcg[:, k_idx],
+                out=np.zeros_like(dcg),
+                where=ideal_dcg[:, k_idx] > 0
+            )
+            ap = np.divide(
+                cumsum_ap[:, k_idx], np.minimum(self.counts_arr, k),
+                out=np.zeros_like(self.counts_arr),
+                where=self.counts_arr > 0
+            )
+            mrr = np.where(
+                (first_hit_idx >= 0) & (first_hit_idx < k),
+                1.0 / (first_hit_idx + 1),
+                0.0
+            )
+            nov = novelty_vals[:, :k].mean(axis=1)
+
             results.append({
                 'model': model_name,
                 'k': k,
-                'precision': met['precision'],
-                'recall': met['recall'],
-                'ndcg': met['ndcg'],
-                'map': met['map'],
-                'mrr': met['mrr'],
-                'novelty': met['novelty'],
+                'precision': float(prec.mean()),
+                'recall': float(rec.mean()),
+                'ndcg': float(ndcg.mean()),
+                'map': float(ap.mean()),
+                'mrr': float(mrr.mean()),
+                'novelty': float(nov.mean()),
                 'coverage': coverage,
-                'n_users': met['n_users']
+                'n_users': int(np.any(hits[:, :k], axis=1).sum())
             })
 
         elapsed = time.time() - start_time
         logger.info("'{}' done in {:.1f}s", model_name, elapsed)
-        
         return results
 
     def evaluate_all_models(
@@ -239,7 +253,6 @@ class RecommendationEvaluator:
     ) -> pd.DataFrame:
         total_start = time.time()
         all_results = []
-        
         for model_name, model in self.models.items():
             try:
                 res = self.evaluate_model(model_name, model, k_values, max_recommendations, batch_size)
@@ -247,7 +260,6 @@ class RecommendationEvaluator:
             except Exception as e:
                 logger.error("Failed {}: {}", model_name, e)
                 continue
-                
         self.results = pd.DataFrame(all_results)
         return self.results
 

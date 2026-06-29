@@ -5,37 +5,47 @@ from typing import List, Dict, Any
 
 class PopularityBaseline:
     def __init__(self):
-        self._sorted_items: np.ndarray = np.empty(0, dtype=np.int64)
-        self._sorted_pops: np.ndarray = np.empty(0, dtype=np.float32)
-        self._pop_lookup: Dict[int, float] = {}
+        self._sorted_items = np.empty(0, dtype=np.int64)
+        self._sorted_items_list = []
+        self._movie_ids_lookup = np.empty(0, dtype=np.int64)
+        self._pops_lookup = np.empty(0, dtype=np.float32)
         self.is_fitted = False
 
     def fit(self, ratings_df: pd.DataFrame) -> "PopularityBaseline":
-        counts = ratings_df.groupby("movieId").size()
-        order = np.argsort(-counts.values)
-        self._sorted_items = counts.index.values[order].astype(np.int64)
-        self._sorted_pops = counts.values[order].astype(np.float32)
-        self._pop_lookup = {
-            int(mid): float(pop)
-            for mid, pop in zip(self._sorted_items, self._sorted_pops)
-        }
+        counts = ratings_df.groupby("movieId").size().sort_values(ascending=False)
+        self._sorted_items = counts.index.values.astype(np.int64)
+        pops_sorted = counts.values.astype(np.float32)
+
+        sort_by_id = np.argsort(self._sorted_items)
+        self._movie_ids_lookup = self._sorted_items[sort_by_id]
+        self._pops_lookup = pops_sorted[sort_by_id]
+
+        self._sorted_items_list = self._sorted_items.tolist()
         self.is_fitted = True
         return self
 
     def predict_scores(self, user_id: int, item_ids: List[int]) -> List[float]:
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction.")
-        return [self._pop_lookup.get(mid, 0.0) for mid in item_ids]
+        item_ids_arr = np.asarray(item_ids, dtype=np.int64)
+        idx = np.searchsorted(self._movie_ids_lookup, item_ids_arr)
+        mask = (idx < len(self._movie_ids_lookup)) & (
+            self._movie_ids_lookup[idx] == item_ids_arr
+        )
+        scores = np.where(mask, self._pops_lookup[idx], 0.0)
+        return scores.tolist()
 
-    def get_top_k_recommendations(self, user_id: int, watched_items: set, k: int = 10) -> List[int]:
+    def get_top_k_recommendations(
+        self, user_id: int, watched_items: set, k: int = 10
+    ) -> List[int]:
         if not self.is_fitted:
             raise RuntimeError("Model must be fitted before prediction.")
         if not watched_items:
-            return self._sorted_items[:k].tolist()
+            return self._sorted_items_list[:k]
         result = []
-        for mid in self._sorted_items:
-            if int(mid) not in watched_items:
-                result.append(int(mid))
+        for mid in self._sorted_items_list:
+            if mid not in watched_items:
+                result.append(mid)
                 if len(result) == k:
                     break
         return result
@@ -51,10 +61,15 @@ class PopularityBaseline:
         results = []
         for watched in watched_items_list:
             if not watched:
-                results.append(self._sorted_items[:k].tolist())
+                results.append(self._sorted_items_list[:k])
             else:
-                w = np.fromiter(watched, np.int64, len(watched))
-                results.append(self._sorted_items[~np.isin(self._sorted_items, w)][:k].tolist())
+                recs = []
+                for mid in self._sorted_items_list:
+                    if mid not in watched:
+                        recs.append(mid)
+                        if len(recs) == k:
+                            break
+                results.append(recs)
         return results
 
     def explain_recommendation(
